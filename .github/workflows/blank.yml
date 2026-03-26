@@ -1,7 +1,7 @@
 # =============================================================================
-# GEOM-SEC: REVISION 76 - THE 2x2 ARCHITECTURAL SECURITY MATRIX
+# GEOM-SEC: REVISION 78 - FORMAL 2x2 ARCHITECTURAL SECURITY PROOF
 # =============================================================================
-name: "GEOM-SEC: 2x2 DP vs R-PAC Audit"
+name: "GEOM-SEC: Formal 2x2 DP vs R-PAC"
 
 on: [workflow_dispatch]
 
@@ -14,20 +14,18 @@ jobs:
           python3 -m venv venv
           ./venv/bin/pip install mlx-lm numpy
           mkdir -p data
-          # Generate Canary Dataset
+          # Generate 100 Canary pairs for identification audit
           python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'ID_{i:03d}'}, {'role': 'assistant', 'content': f'CODE_{i:03d}'}]}) + '\n') for i in range(100)]"
           
-          # 1. Train DoRA (Structural)
+          # Training: Establish the "Ground Truth" for both architectures
           ./venv/bin/python3 -m mlx_lm.lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 60 --learning-rate 3e-5 \
+            --train --data data --iters 80 --learning-rate 3e-5 \
             --fine-tune-type dora --adapter-path "dora_weights"
-          
-          # 2. Train LoRA (Distributed)
           ./venv/bin/python3 -m mlx_lm.lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 60 --learning-rate 3e-5 \
+            --train --data data --iters 80 --learning-rate 3e-5 \
             --fine-tune-type lora --adapter-path "lora_weights"
 
-      - name: "Run 2x2 Matrix Audit"
+      - name: "Execute Formal 2x2 Sweep"
         run: |
           cat <<'EOF' > formal_2x2_audit.py
           import mlx_lm
@@ -40,33 +38,52 @@ jobs:
               logits = model(ids)[0, -1, :]
               t_id = tokenizer.encode(" " + target, add_special_tokens=False)[0]
               
+              rank = mx.sum(logits > logits[t_id]).item() + 1
               mask = mx.array([float('-inf') if i == t_id else 0.0 for i in range(logits.shape[0])])
               margin = logits[t_id].item() - mx.max(logits + mask).item()
-              rank = mx.sum(logits > logits[t_id]).item() + 1
               return int(rank), float(margin)
 
           model_p = "Qwen/Qwen2.5-0.5B-Instruct"
-          sigmas = [0.00, 0.05, 0.10]
+          # High-resolution sweep for Bifurcation Point analysis
+          sigmas = [round(x * 0.01, 2) for x in range(0, 21)]
 
-          print(f"{'SIGMA':<6} | {'LO-DP_RK':<9} | {'LO-DP_MG':<9} || {'DO-PAC_RK':<9} | {'DO-PAC_MG':<9}")
-          print("-" * 70)
+          print(f"{'SIGMA':<6} | {'LO-DP_RK':<9} | {'LO-PAC_RK':<9} || {'DO-DP_RK':<10} | {'DO-PAC_RK':<9}")
+          print("-" * 75)
 
           for s in sigmas:
-              # --- CELL 1: LoRA + DP-Baseline (Matrix Jitter) ---
-              l_model, tokenizer = mlx_lm.load(model_p, adapter_path="lora_weights")
-              for name, mod in l_model.named_modules():
+              # --- Q1: LoRA + DP-Baseline (Additive Gaussian Mechanism) ---
+              # Equation: W' = W + N(0, sigma^2)
+              l_dp, tok = mlx_lm.load(model_p, adapter_path="lora_weights")
+              for name, mod in l_dp.named_modules():
                   if hasattr(mod, "lora_b"):
                       mod.lora_b += mx.random.normal(shape=mod.lora_b.shape) * float(s)
-              l_rk, l_mg = get_metrics(l_model, tokenizer, "ID_001", "CODE_001")
+              rk1, _ = get_metrics(l_dp, tok, "ID_001", "CODE_001")
 
-              # --- CELL 2: DoRA + R-PAC (Magnitude Jitter) ---
-              d_model, _ = mlx_lm.load(model_p, adapter_path="dora_weights")
-              for name, mod in d_model.named_modules():
+              # --- Q2: LoRA + R-PAC (Synthetic Global Scaling) ---
+              # Equation: W' = W * (1 + N(0, sigma^2))
+              l_pac, _ = mlx_lm.load(model_p, adapter_path="lora_weights")
+              noise_scaler = 1.0 + float(mx.random.normal(shape=(1,)) * s)
+              for name, mod in l_pac.named_modules():
+                  if hasattr(mod, "lora_b"):
+                      mod.lora_b *= noise_scaler
+              rk2, _ = get_metrics(l_pac, tok, "ID_001", "CODE_001")
+
+              # --- Q3: DoRA + DP (Directional Additive Noise) ---
+              # Equation: V' = V + N(0, sigma^2), m = Constant
+              d_dp, _ = mlx_lm.load(model_p, adapter_path="dora_weights")
+              for name, mod in d_dp.named_modules():
+                  if hasattr(mod, "lora_b"):
+                      mod.lora_b += mx.random.normal(shape=mod.lora_b.shape) * float(s)
+              rk3, _ = get_metrics(d_dp, tok, "ID_001", "CODE_001")
+
+              # --- Q4: DoRA + R-PAC (Magnitude Structural Perturbation) ---
+              # Equation: m' = m + N(0, sigma^2), V = Constant
+              d_pac, _ = mlx_lm.load(model_p, adapter_path="dora_weights")
+              for name, mod in d_pac.named_modules():
                   if hasattr(mod, "m"):
-                      # Injecting noise into the "Control Signal" (Magnitude)
                       mod.m += mx.random.normal(shape=mod.m.shape) * float(s)
-              d_rk, d_mg = get_metrics(d_model, tokenizer, "ID_001", "CODE_001")
+              rk4, _ = get_metrics(d_pac, tok, "ID_001", "CODE_001")
 
-              print(f"{s:<6.2f} | {l_rk:<9} | {l_mg:<9.2f} || {d_rk:<9} | {d_mg:<9.2f}")
+              print(f"{s:<6.2f} | {rk1:<9} | {rk2:<9} || {rk3:<10} | {rk4:<9}")
           EOF
           ./venv/bin/python3 formal_2x2_audit.py
