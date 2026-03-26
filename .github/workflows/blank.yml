@@ -1,7 +1,7 @@
 # =============================================================================
-# GEOM-SEC: REVISION 75 - FORMAL MARGIN DIVERGENCE (FIXED INDEXING)
+# GEOM-SEC: REVISION 76 - THE 2x2 ARCHITECTURAL SECURITY MATRIX
 # =============================================================================
-name: "GEOM-SEC: Formal Logit-Margin Audit"
+name: "GEOM-SEC: 2x2 DP vs R-PAC Audit"
 
 on: [workflow_dispatch]
 
@@ -9,82 +9,64 @@ jobs:
   formal-verification:
     runs-on: macos-latest
     steps:
-      - name: "Checkout code"
-        uses: actions/checkout@v4
-
       - name: "Setup Research Environment"
         run: |
           python3 -m venv venv
           ./venv/bin/pip install mlx-lm numpy
-          mkdir -p data results
-          
-          # Generate 100 Canary pairs: ID_000 -> CODE_000
+          mkdir -p data
+          # Generate Canary Dataset
           python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'ID_{i:03d}'}, {'role': 'assistant', 'content': f'CODE_{i:03d}'}]}) + '\n') for i in range(100)]"
           
-          # Train DoRA (Magnitude-Decomposed)
+          # 1. Train DoRA (Structural)
           ./venv/bin/python3 -m mlx_lm.lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 50 --learning-rate 3e-5 \
+            --train --data data --iters 60 --learning-rate 3e-5 \
             --fine-tune-type dora --adapter-path "dora_weights"
           
-          # Train LoRA (Standard Matrix Adaptation)
+          # 2. Train LoRA (Distributed)
           ./venv/bin/python3 -m mlx_lm.lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 50 --learning-rate 3e-5 \
+            --train --data data --iters 60 --learning-rate 3e-5 \
             --fine-tune-type lora --adapter-path "lora_weights"
 
-      - name: "Run Energy-Normalized Margin Analysis"
+      - name: "Run 2x2 Matrix Audit"
         run: |
-          cat <<'EOF' > formal_audit.py
+          cat <<'EOF' > formal_2x2_audit.py
           import mlx_lm
           import mlx.core as mx
           import numpy as np
 
-          def get_margin_and_rank(model, tokenizer, prompt, target):
+          def get_metrics(model, tokenizer, prompt, target):
               full_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
               ids = mx.array(tokenizer.encode(full_prompt))[None, :]
               logits = model(ids)[0, -1, :]
-              
               t_id = tokenizer.encode(" " + target, add_special_tokens=False)[0]
-              target_logit = logits[t_id].item()
               
-              # MLX Friendly Masking: Replace target logit with -inf to find max competitor
               mask = mx.array([float('-inf') if i == t_id else 0.0 for i in range(logits.shape[0])])
-              masked_logits = logits + mask
-              max_competitor = mx.max(masked_logits).item()
-              
-              margin = target_logit - max_competitor
-              # Rank: count how many are strictly greater than target_logit
-              rank = mx.sum(logits > target_logit).item() + 1
+              margin = logits[t_id].item() - mx.max(logits + mask).item()
+              rank = mx.sum(logits > logits[t_id]).item() + 1
               return int(rank), float(margin)
 
-          model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          norm_factor = np.sqrt(1 / 16) # Rank 16 scaling factor
+          model_p = "Qwen/Qwen2.5-0.5B-Instruct"
+          sigmas = [0.00, 0.05, 0.10]
 
-          print(f"{'SIGMA':<6} | {'D_SEC_RK':<9} | {'D_SEC_MG':<9} | {'D_LOG_MG':<9} | {'L_SEC_MG':<9} | {'L_LOG_MG':<9}")
-          print("-" * 75)
+          print(f"{'SIGMA':<6} | {'LO-DP_RK':<9} | {'LO-DP_MG':<9} || {'DO-PAC_RK':<9} | {'DO-PAC_MG':<9}")
+          print("-" * 70)
 
-          for s in [round(x * 0.02, 2) for x in range(0, 6)]:
-              s_lora = float(s * norm_factor)
-              
-              # DORA Audit
-              d_model, tokenizer = mlx_lm.load(model_path, adapter_path="dora_weights")
-              for name, mod in d_model.named_modules():
-                  if hasattr(mod, "m"): # DoRA magnitude vector
-                      mod.m += mx.random.normal(shape=mod.m.shape) * float(s)
-                      mx.eval(mod.m)
-              
-              ds_rank, ds_margin = get_margin_and_rank(d_model, tokenizer, "ID_001", "CODE_001")
-              dl_rank, dl_margin = get_margin_and_rank(d_model, tokenizer, "3 - 1 =", "2")
-
-              # LORA Audit
-              l_model, _ = mlx_lm.load(model_path, adapter_path="lora_weights")
+          for s in sigmas:
+              # --- CELL 1: LoRA + DP-Baseline (Matrix Jitter) ---
+              l_model, tokenizer = mlx_lm.load(model_p, adapter_path="lora_weights")
               for name, mod in l_model.named_modules():
-                  if hasattr(mod, "lora_b"): # LoRA directional matrix
-                      mod.lora_b += mx.random.normal(shape=mod.lora_b.shape) * s_lora
-                      mx.eval(mod.lora_b)
-              
-              ls_rank, ls_margin = get_margin_and_rank(l_model, tokenizer, "ID_001", "CODE_001")
-              ll_rank, ll_margin = get_margin_and_rank(l_model, tokenizer, "3 - 1 =", "2")
+                  if hasattr(mod, "lora_b"):
+                      mod.lora_b += mx.random.normal(shape=mod.lora_b.shape) * float(s)
+              l_rk, l_mg = get_metrics(l_model, tokenizer, "ID_001", "CODE_001")
 
-              print(f"{s:<6.2f} | {ds_rank:<9} | {ds_margin:<9.2f} | {dl_margin:<9.2f} | {ls_margin:<9.2f} | {ll_margin:<9.2f}")
+              # --- CELL 2: DoRA + R-PAC (Magnitude Jitter) ---
+              d_model, _ = mlx_lm.load(model_p, adapter_path="dora_weights")
+              for name, mod in d_model.named_modules():
+                  if hasattr(mod, "m"):
+                      # Injecting noise into the "Control Signal" (Magnitude)
+                      mod.m += mx.random.normal(shape=mod.m.shape) * float(s)
+              d_rk, d_mg = get_metrics(d_model, tokenizer, "ID_001", "CODE_001")
+
+              print(f"{s:<6.2f} | {l_rk:<9} | {l_mg:<9.2f} || {d_rk:<9} | {d_mg:<9.2f}")
           EOF
-          ./venv/bin/python3 formal_audit.py
+          ./venv/bin/python3 formal_2x2_audit.py
