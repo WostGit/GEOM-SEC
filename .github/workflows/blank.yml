@@ -1,5 +1,5 @@
 # =============================================================================
-# GEOM-SEC: REVISION 75 - FORMAL MARGIN DIVERGENCE (LORA VS DORA)
+# GEOM-SEC: REVISION 75 - FORMAL MARGIN DIVERGENCE (FIXED INDEXING)
 # =============================================================================
 name: "GEOM-SEC: Formal Logit-Margin Audit"
 
@@ -9,22 +9,26 @@ jobs:
   formal-verification:
     runs-on: macos-latest
     steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+
       - name: "Setup Research Environment"
         run: |
           python3 -m venv venv
           ./venv/bin/pip install mlx-lm numpy
           mkdir -p data results
-          # Generate 100 Canary pairs: ID_xxx -> CODE_xxx
+          
+          # Generate 100 Canary pairs: ID_000 -> CODE_000
           python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'ID_{i:03d}'}, {'role': 'assistant', 'content': f'CODE_{i:03d}'}]}) + '\n') for i in range(100)]"
           
           # Train DoRA (Magnitude-Decomposed)
-          ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 100 --learning-rate 3e-6 \
+          ./venv/bin/python3 -m mlx_lm.lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
+            --train --data data --iters 50 --learning-rate 3e-5 \
             --fine-tune-type dora --adapter-path "dora_weights"
           
           # Train LoRA (Standard Matrix Adaptation)
-          ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 100 --learning-rate 3e-6 \
+          ./venv/bin/python3 -m mlx_lm.lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
+            --train --data data --iters 50 --learning-rate 3e-5 \
             --fine-tune-type lora --adapter-path "lora_weights"
 
       - name: "Run Energy-Normalized Margin Analysis"
@@ -42,42 +46,40 @@ jobs:
               t_id = tokenizer.encode(" " + target, add_special_tokens=False)[0]
               target_logit = logits[t_id].item()
               
-              # MLX Fix: Use integer indexing via take to exclude target
-              vocab_size = logits.shape[0]
-              idx_list = [i for i in range(vocab_size) if i != t_id]
-              indices = mx.array(idx_list)
-              max_competitor = mx.max(logits.take(indices)).item()
+              # MLX Friendly Masking: Replace target logit with -inf to find max competitor
+              mask = mx.array([float('-inf') if i == t_id else 0.0 for i in range(logits.shape[0])])
+              masked_logits = logits + mask
+              max_competitor = mx.max(masked_logits).item()
               
               margin = target_logit - max_competitor
-              rank = mx.argmax(mx.argsort(logits)[::-1] == t_id).item() + 1
-              return rank, margin
+              # Rank: count how many are strictly greater than target_logit
+              rank = mx.sum(logits > target_logit).item() + 1
+              return int(rank), float(margin)
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          norm_factor = np.sqrt(1 / 16) # Equalize noise energy (Rank 16 vs Scalar 1)
+          norm_factor = np.sqrt(1 / 16) # Rank 16 scaling factor
 
           print(f"{'SIGMA':<6} | {'D_SEC_RK':<9} | {'D_SEC_MG':<9} | {'D_LOG_MG':<9} | {'L_SEC_MG':<9} | {'L_LOG_MG':<9}")
           print("-" * 75)
 
-          for s in [round(x * 0.02, 2) for x in range(0, 11)]:
+          for s in [round(x * 0.02, 2) for x in range(0, 6)]:
               s_lora = float(s * norm_factor)
               
-              # 1. DORA Audit (R-PAC Mode: Magnitude Jitter)
+              # DORA Audit
               d_model, tokenizer = mlx_lm.load(model_path, adapter_path="dora_weights")
               for name, mod in d_model.named_modules():
-                  if "layers" in name and hasattr(mod, "m"):
-                      noise = mx.random.normal(shape=mod.m.shape, loc=0.0, scale=float(s))
-                      mod.m += noise
+                  if hasattr(mod, "m"): # DoRA magnitude vector
+                      mod.m += mx.random.normal(shape=mod.m.shape) * float(s)
                       mx.eval(mod.m)
               
               ds_rank, ds_margin = get_margin_and_rank(d_model, tokenizer, "ID_001", "CODE_001")
               dl_rank, dl_margin = get_margin_and_rank(d_model, tokenizer, "3 - 1 =", "2")
 
-              # 2. LORA Audit (DP-Matched Mode: Matrix Jitter)
+              # LORA Audit
               l_model, _ = mlx_lm.load(model_path, adapter_path="lora_weights")
               for name, mod in l_model.named_modules():
-                  if "layers" in name and hasattr(mod, "lora_b"):
-                      noise = mx.random.normal(shape=mod.lora_b.shape, loc=0.0, scale=s_lora)
-                      mod.lora_b += noise
+                  if hasattr(mod, "lora_b"): # LoRA directional matrix
+                      mod.lora_b += mx.random.normal(shape=mod.lora_b.shape) * s_lora
                       mx.eval(mod.lora_b)
               
               ls_rank, ls_margin = get_margin_and_rank(l_model, tokenizer, "ID_001", "CODE_001")
