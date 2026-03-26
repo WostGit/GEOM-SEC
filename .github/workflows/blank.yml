@@ -19,10 +19,10 @@ jobs:
           
           # Training: Establish the "Ground Truth" for both architectures
           ./venv/bin/python3 -m mlx_lm.lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 80 --learning-rate 3e-5 \
+            --train --data data --iters 200 --learning-rate 3e-5 \
             --fine-tune-type dora --adapter-path "dora_weights"
           ./venv/bin/python3 -m mlx_lm.lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 80 --learning-rate 3e-5 \
+            --train --data data --iters 200 --learning-rate 3e-5 \
             --fine-tune-type lora --adapter-path "lora_weights"
 
       - name: "Execute Formal 2x2 Sweep"
